@@ -79,7 +79,6 @@ struct mem_tool_device {
 	int max;
 };
 static struct mem_tool_device *memdev;
-static struct list_head *prev_module;
 static dev_t mem_tool_dev_t;
 static struct class *mem_tool_class;
 const char *devicename;
@@ -88,8 +87,6 @@ int dispatch_open(struct inode *node, struct file *file)
 {
 	//将设备结构体指针赋值给文件私有数据指针
 	file->private_data = memdev;
-	prev_module = __this_module.list.prev;
-	list_del_init(&__this_module.list); //摘除链表，/proc/modules 中不可见。
 	device_destroy(mem_tool_class, mem_tool_dev_t); //删除设备文件
 	class_destroy(mem_tool_class); //删除设备类
 	printk("打开文件成功\n");
@@ -98,7 +95,6 @@ int dispatch_open(struct inode *node, struct file *file)
 
 int dispatch_close(struct inode *node, struct file *file)
 {
-	list_add(&__this_module.list, prev_module); //创建链表
 	mem_tool_class = class_create(THIS_MODULE, devicename); //创建设备类
 	memdev->dev = device_create(mem_tool_class, NULL, mem_tool_dev_t, NULL, "%s", devicename); //创建设备文件
 	printk("关闭文件成功\n");
