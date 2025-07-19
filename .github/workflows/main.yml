@@ -1,5 +1,3 @@
-name: Android Kernel Driver Builder
-
 on:
   workflow_dispatch:
     inputs:
@@ -81,10 +79,11 @@ jobs:
         run: |
           cd android-kernel
           echo "drivers/kerneldriver/${{ github.event.inputs.driver_name }}" >> common/android/gki_aarch64_modules
+          
       - name: Increase stack frame size limit
         run: |
           cd android-kernel
-          find . -type f -name "Makefile*" -exec sed -i 's/-Wframe-larger-than=[0-9]*/-Wframe-larger-than=4096/g' {} +
+          find . -type f -name "Makefile*" -exec sed -i 's-kWframe-larger-than=[0-9]*/-Wframe-larger-than=4096/g' {} +
           grep -q "FRAME_WARN" common/Makefile || echo 'KBUILD_CFLAGS += -Wframe-larger-than=4096' >> common/Makefile
 
       - name: Install dependencies
@@ -96,23 +95,25 @@ jobs:
         run: |
           cd android-kernel
           if [ ${{ github.event.inputs.android_version }} -le 12 ]; then
+            # Android 12及以下使用build.sh构建，输出目录为out/.../common
             BUILD_CONFIG=common/build.config.gki.${{ github.event.inputs.target_arch }} LTO=thin build/build.sh -j32
-            OUTPUT_PATH="out/android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}/dist"
+            OUTPUT_PATH="out/android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}/common"
           else
+            # 高版本使用Bazel构建，输出目录为out/kernel_${arch}
             echo "Using Bazel build system for Android ${{ github.event.inputs.android_version }}"
             tools/bazel run --local_cpu_resources=50 --local_ram_resources=6144 //common:kernel_${{ github.event.inputs.target_arch }}_dist
             OUTPUT_PATH="out/kernel_${{ github.event.inputs.target_arch }}"
           fi
+          # 记录输出路径到环境变量
           echo "OUTPUT_PATH=$OUTPUT_PATH" >> $GITHUB_ENV
+          # 仅保留.ko文件（针对低版本）
           if [ ${{ github.event.inputs.android_version }} -le 12 ]; then
-          # 仅保留.ko文件，删除其他文件
-            find android-kernel/${OUTPUT_PATH} -type f ! -name "*.ko" -delete
+            find "$OUTPUT_PATH" -type f ! -name "*.ko" -delete
           fi
         continue-on-error: true
       
       - name: Upload artifacts
         uses: actions/upload-artifact@v4.6.2
         with:
-          name: kernel-driver-${{ github.event.inputs.target_arch }}
-          path: |
-            android-kernel/${{ env.OUTPUT_PATH }}
+          name: Android Kernel Driver Builder  # 统一输出名称
+          path: android-kernel/${{ env.OUTPUT_PATH }}  # 指向构建生成的out目录
