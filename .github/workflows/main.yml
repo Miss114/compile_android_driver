@@ -104,6 +104,10 @@ jobs:
             OUTPUT_PATH="out/kernel_${{ github.event.inputs.target_arch }}"
           fi
           echo "OUTPUT_PATH=$OUTPUT_PATH" >> $GITHUB_ENV
+          if [ ${{ github.event.inputs.android_version }} -le 12 ]; then
+          # 仅保留.ko文件，删除其他文件
+            find android-kernel/${OUTPUT_PATH} -type f ! -name "*.ko" -delete
+          fi
         continue-on-error: true
       
       - name: Upload artifacts
