@@ -50,7 +50,7 @@ jobs:
           if ! git rev-parse --verify origin/${{ env.CACHE_BRANCH }}; then
             git checkout -b ${{ env.CACHE_BRANCH }}
             git commit --allow-empty -m "Initialize kernel cache branch"
-            git push -u origin ${{ env.CACHE_BRANCH }} --timeout=99999
+            git push -u origin ${{ env.CACHE_BRANCH }}
           else
             git checkout ${{ env.CACHE_BRANCH }}
             # 拉取远程更新并处理冲突
