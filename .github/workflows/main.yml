@@ -21,7 +21,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      CACHE_BRANCH: kernel-cache-${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}
+      CACHE_BRANCH: kernel-cache-${{ github.event.input.inputs.android_version }}-${{ github.event.inputs.kernel_version }}
       KERNEL_DIR: android-kernel
       INITIAL_BUILD_MARKER: .initial_build_complete
 
@@ -41,8 +41,10 @@ jobs:
             git checkout -b ${{ env.CACHE_BRANCH }}
             git commit --allow-empty -m "Initialize kernel cache branch"
             git push -u origin ${{ env.CACHE_BRANCH }}
+          else
+            git checkout ${{ env.CACHE_BRANCH }}
+            git pull origin ${{ env.CACHE_BRANCH }}
           fi
-          git checkout ${{ env.CACHE_BRANCH }}
           # Restore main branch code while keeping cache
           git checkout main -- .
 
