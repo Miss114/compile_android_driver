@@ -21,164 +21,161 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      # 仅缓存符号文件的分支（不含完整源码）
-      SYMBOLS_BRANCH: kernel-symbols-${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}-${{ github.event.inputs.target_arch }}
+      # 缓存文件相关配置
+      CACHE_ARCHIVE: kernel-build-cache-${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}-${{ github.event.inputs.target_arch }}.tar.gz
+      CACHE_DIR: .kernel_cache
       KERNEL_DIR: android-kernel
-      # 符号文件路径（用于模块编译依赖）
-      SYMBOLS_PATH: kernel-symbols
-      # 目标模块名称
-      TARGET_MODULE: ${{ github.event.inputs.driver_name }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4.2.2
-        with:
-          fetch-depth: 0
-
-      - name: Configure Git
+        
+      - name: Check for existing build cache
+        id: cache_check
         run: |
-          git config --global user.email "1917767839@qq.com"
-          git config --global user.name "Miss"
-          git lfs install  # 用于处理大型符号文件
-
-      - name: Prepare symbols branch
-        run: |
-          # 创建或切换符号缓存分支
-          if ! git rev-parse --verify origin/${{ env.SYMBOLS_BRANCH }}; then
-            git checkout -b ${{ env.SYMBOLS_BRANCH }}
-            git commit --allow-empty -m "Init kernel symbols branch"
-            git push -u origin ${{ env.SYMBOLS_BRANCH }}
+          if [ -f "${{ env.CACHE_ARCHIVE }}" ]; then
+            echo "cache_exists=true" >> $GITHUB_OUTPUT
           else
-            git checkout ${{ env.SYMBOLS_BRANCH }}
-            git pull origin ${{ env.SYMBOLS_BRANCH }} --rebase --autostash
+            echo "cache_exists=false" >> $GITHUB_OUTPUT
           fi
-          # 恢复主分支代码
-          git checkout main -- .
-          # 创建符号文件存储目录
-          mkdir -p ${{ env.SYMBOLS_PATH }}
 
-      - name: Check symbols cache
-        id: symbols_check
+      - name: Extract build cache (if exists)
+        if: steps.cache_check.outputs.cache_exists == 'true'
         run: |
-          # 检查关键符号文件是否存在（用于模块编译）
-          if [ -f "${{ env.SYMBOLS_PATH }}/Module.symvers" ] && [ -f "${{ env.SYMBOLS_PATH }}/.config" ]; then
-            echo "symbols_cached=true" >> $GITHUB_OUTPUT
-          else
-            echo "symbols_cached=false" >> $GITHUB_OUTPUT
-          fi
+          mkdir -p ${{ env.KERNEL_DIR }}
+          tar -zxf ${{ env.CACHE_ARCHIVE }} -C ${{ env.KERNEL_DIR }}
 
       - name: Prepare kerneldriver directory
         run: |
-          mkdir -p kerneldriver
-          if [ -z "$(ls -A ./code/ 2>/dev/null)" ]; then
-            echo "Error: No driver source files found in code directory"
-            exit 1
-          fi
+          mkdir kerneldriver
           mv ./code/*.h ./code/*.c ./code/Makefile kerneldriver/
-
-      - name: Install repo tool
-        if: steps.symbols_check.outputs.symbols_cached == 'false'
+          
+      - name: Install repo tool (if no cache)
+        if: steps.cache_check.outputs.cache_exists == 'false'
         run: |
           sudo curl -L https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
           sudo chmod a+x /usr/local/bin/repo
 
-      - name: Fetch kernel source (first run only)
-        if: steps.symbols_check.outputs.symbols_cached == 'false'
+      - name: Set up Android Kernel source (if no cache)
+        if: steps.cache_check.outputs.cache_exists == 'false'
         run: |
           mkdir -p ${{ env.KERNEL_DIR }} && cd ${{ env.KERNEL_DIR }}
           repo init -u https://android.googlesource.com/kernel/manifest -b common-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}
-          repo sync -j4 -c --no-tags --optimized-fetch --force-sync  # 低并行避免网络问题
+          repo sync -j$(nproc) -c --no-tags --optimized-fetch --force-sync
 
-      - name: Copy driver to source
+      - name: Copy kerneldriver
         run: |
-          # 若首次运行，使用新拉取的源码；否则使用临时目录
-          if [ "${{ steps.symbols_check.outputs.symbols_cached }}" = "false" ]; then
-            cp -r kerneldriver ${{ env.KERNEL_DIR }}/common/drivers/
-          else
-            mkdir -p temp-kernel/common/drivers
-            cp -r kerneldriver temp-kernel/common/drivers/
-            # 复制缓存的符号文件到临时目录
-            cp -r ${{ env.SYMBOLS_PATH }}/* temp-kernel/
-          fi
+          cd ${{ env.KERNEL_DIR }}
+          cp -r ../kerneldriver common/drivers
 
-      - name: Modify build configs
+      - name: Modify Makefile
         run: |
-          # 根据是否有缓存选择目录
-          if [ "${{ steps.symbols_check.outputs.symbols_cached }}" = "false" ]; then
-            KERNEL_SRC_DIR="${{ env.KERNEL_DIR }}/common"
-          else
-            KERNEL_SRC_DIR="temp-kernel"
-          fi
+          cd ${{ env.KERNEL_DIR }}
+          echo "obj-y += kerneldriver/" >> common/drivers/Makefile
+
+      - name: Add module to GKI modules list
+        if: ${{ github.event.inputs.android_version > 13 }}
+        run: |
+          cd ${{ env.KERNEL_DIR }}
+          MODULE_NAME="drivers/kerneldriver/${{ github.event.inputs.driver_name }}"
           
-          # 修改Makefile添加驱动
-          if ! grep -q "obj-y += kerneldriver/" $KERNEL_SRC_DIR/drivers/Makefile; then
-            echo "obj-y += kerneldriver/" >> $KERNEL_SRC_DIR/drivers/Makefile
-          fi
-          
-          # 添加到GKI模块列表
-          if [ ${{ github.event.inputs.android_version }} -gt 13 ]; then
-            MODULE_ENTRY="drivers/kerneldriver/${{ env.TARGET_MODULE }}"
-            awk -i inplace -v module="$MODULE_ENTRY" '
-              BEGIN { added=0 }
-              /_COMMON_GKI_MODULES_LIST = \[/ { in_list=1 }
-              in_list && /\]/ {
-                if (!added) { print "    \"" module "\","; added=1 }
-                in_list=0
+          awk -i inplace -v module="$MODULE_NAME" '
+            BEGIN { added=0 }
+            /_COMMON_GKI_MODULES_LIST = \[/ { in_list=1 }
+            in_list && /\]/ {
+              if (!added) {
+                print "    \"" module "\","
+                added=1
               }
-              in_list && !added { if (module < $0) { print "    \"" module "\","; added=1 } }
-              { print }
-            ' $KERNEL_SRC_DIR/modules.bzl
-          else
-            echo "drivers/kerneldriver/${{ env.TARGET_MODULE }}" >> $KERNEL_SRC_DIR/android/gki_${{ github.event.inputs.target_arch }}_modules
-          fi
+              in_list=0
+            }
+            in_list && !added {
+              if (module < $0) {
+                print "    \"" module "\","
+                added=1
+              }
+            }
+            { print }
+          ' common/modules.bzl
+          
+      - name: Prepare module list for legacy builds
+        if: ${{ github.event.inputs.android_version <= 13 }}
+        run: |
+          cd ${{ env.KERNEL_DIR }}
+          echo "drivers/kerneldriver/${{ github.event.inputs.driver_name }}" >> common/android/gki_aarch64_modules
+
+      - name: Increase stack frame size limit
+        run: |
+          cd ${{ env.KERNEL_DIR }}
+          find . -type f -name "Makefile*" -exec sed -i 's/-Wframe-larger-than=[0-9]*/-Wframe-larger-than=4096/g' {} +
+          grep -q "FRAME_WARN" common/Makefile || echo 'KBUILD_CFLAGS += -Wframe-larger-than=4096' >> common/Makefile
 
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc python-is-python3
 
-      - name: Build kernel (first run) and module
+      - name: Build kernel module
         run: |
-          export ARCH=${{ github.event.inputs.target_arch }}
-          # 首次运行：全量编译内核并提取符号文件；后续：仅编译模块
-          if [ "${{ steps.symbols_check.outputs.symbols_cached }}" = "false" ]; then
-            cd ${{ env.KERNEL_DIR }}
-            if [ ${{ github.event.inputs.android_version }} -le 12 ]; then
-              BUILD_CONFIG=common/build.config.gki.${{ github.event.inputs.target_arch }} LTO=thin build/build.sh -j$(nproc)
-              OUTPUT_DIR="out/android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}/dist"
+          cd ${{ env.KERNEL_DIR }}
+          if [ ${{ github.event.inputs.android_version }} -le 12 ]; then
+            # 首次编译全量，后续仅编译模块
+            if [ "${{ steps.cache_check.outputs.cache_exists }}" = "true" ]; then
+              BUILD_CONFIG=common/build.config.gki.${{ github.event.inputs.target_arch }} LTO=thin build/build.sh -j32 modules
+            else
+              BUILD_CONFIG=common/build.config.gki.${{ github.event.inputs.target_arch }} LTO=thin build/build.sh -j32
+            fi
+            OUTPUT_PATH="out/android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}/dist"
+            cd "$OUTPUT_PATH"
+            rm -f Image \
+              abi_symbollist \
+              abi.xml \
+              abi.prop \
+              kernel-uapi-headers.tar.gz \
+              kernel-headers.tar.gz \
+              Image.lz4 \
+              System.map \
+              modules.builtin.modinfo \
+              modules.builtin \
+              vmlinux.symvers \
+              test_mappings.zip \
+              vmlinux          
+          else
+            echo "Using Bazel build system for Android ${{ github.event.inputs.android_version }}"
+            # 首次编译全量，后续仅编译模块
+            if [ "${{ steps.cache_check.outputs.cache_exists }}" = "true" ]; then
+              tools/bazel run --local_cpu_resources=50 --local_ram_resources=6144 //common:kernel_${{ github.event.inputs.target_arch }}_modules
             else
               tools/bazel run --local_cpu_resources=50 --local_ram_resources=6144 //common:kernel_${{ github.event.inputs.target_arch }}_dist
-              OUTPUT_DIR="out/kernel_${{ github.event.inputs.target_arch }}"
             fi
-            # 提取符号文件（供后续模块编译）
-            cp $OUTPUT_DIR/Module.symvers $OUTPUT_DIR/.config $OUTPUT_DIR/vmlinux ${{ env.SYMBOLS_PATH }}/
-          else
-            cd temp-kernel
-            # 使用缓存的符号文件编译模块
-            make -j$(nproc) modules
-            OUTPUT_DIR="."  # 临时目录直接输出
+            OUTPUT_PATH="out/kernel_${{ github.event.inputs.target_arch }}"
           fi
-          # 记录模块输出路径
-          echo "MODULE_OUTPUT_DIR=$OUTPUT_DIR" >> $GITHUB_ENV
-
-      - name: Cache kernel symbols (first run only)
-        if: steps.symbols_check.outputs.symbols_cached == 'false'
-        run: |
-          git checkout ${{ env.SYMBOLS_BRANCH }}
-          # 仅缓存符号文件（不包含完整源码）
-          git lfs track "${{ env.SYMBOLS_PATH }}/*"
-          git add .gitattributes
-          git add ${{ env.SYMBOLS_PATH }}
-          git commit -m "Cache symbols for Android ${{ github.event.inputs.android_version }} kernel ${{ github.event.inputs.kernel_version }}"
-          git push -u origin ${{ env.SYMBOLS_BRANCH }} --compress=9
-
-      - name: Upload only target .ko module
+          echo "OUTPUT_PATH=$OUTPUT_PATH" >> $GITHUB_ENV
+        continue-on-error: true
+      
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4.6.2
         with:
-          name: target-driver-${{ github.event.inputs.target_arch }}
+          name: kernel-driver-${{ github.event.inputs.target_arch }}
           path: |
-            ${{ env.MODULE_OUTPUT_DIR }}/${{ env.TARGET_MODULE }}
-            # 确保只包含目标模块，排除其他文件
-            !${{ env.MODULE_OUTPUT_DIR }}/*.img
-            !${{ env.MODULE_OUTPUT_DIR }}/Image
-            !${{ env.MODULE_OUTPUT_DIR }}/vmlinux
+            ${{ env.KERNEL_DIR }}/${{ env.OUTPUT_PATH }}
+
+      - name: Prepare build cache (first run only)
+        if: steps.cache_check.outputs.cache_exists == 'false'
+        run: |
+          # 仅保留编译模块必需的文件（源码、配置、符号文件等）
+          cd ${{ env.KERNEL_DIR }}
+          # 清理冗余文件减小缓存体积
+          rm -rf .repo/projects/*/.git .repo/project-objects/*/.git out/*.zip out/*.tar.gz
+          # 压缩缓存文件
+          cd ..
+          tar -zcf ${{ env.CACHE_ARCHIVE }} -C ${{ env.KERNEL_DIR }} .
+
+      - name: Upload build cache to repository
+        if: steps.cache_check.outputs.cache_exists == 'false'
+        run: |
+          git config --global user.email "1917767839@qq.com"
+          git config --global user.name "Miss"
+          git add ${{ env.CACHE_ARCHIVE }}
+          git commit -m "Add build cache for Android ${{ github.event.inputs.android_version }} kernel ${{ github.event.inputs.kernel_version }} ${{ github.event.inputs.target_arch }}"
+          git push origin main
