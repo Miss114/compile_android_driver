@@ -1,0 +1,189 @@
+name: Android Kernel Driver Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      android_version:
+        description: 'Android Version (Kernel) (e.g., 14)'
+        required: true
+      kernel_version:
+        description: 'Kernel Version (e.g., 6.1)'
+        required: true
+      driver_name:
+        description: 'Driver Module Name (e.g., mydriver.ko)'
+        required: true
+      target_arch:
+        description: 'Target Architecture (aarch64, x86_64, etc.)'
+        required: true
+        default: 'aarch64'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      CACHE_BRANCH: kernel-cache-${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}
+      KERNEL_DIR: android-kernel
+      INITIAL_BUILD_MARKER: .initial_build_complete
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4.2.2
+
+      - name: Prepare cache branch
+        run: |
+          # Create cache branch if not exists
+          if ! git rev-parse --verify origin/${{ env.CACHE_BRANCH }}; then
+            git checkout -b ${{ env.CACHE_BRANCH }}
+            git commit --allow-empty -m "Initialize kernel cache branch"
+            git push -u origin ${{ env.CACHE_BRANCH }}
+          fi
+          git checkout ${{ env.CACHE_BRANCH }}
+          # Restore main branch code while keeping cache
+          git checkout main -- .
+
+      - name: Check cache status
+        id: cache_check
+        run: |
+          if [ -d "${{ env.KERNEL_DIR }}/.repo" ] && [ -f "${{ env.KERNEL_DIR }}/common/Makefile" ]; then
+            echo "kernel_cached=true" >> $GITHUB_OUTPUT
+          else
+            echo "kernel_cached=false" >> $GITHUB_OUTPUT
+          fi
+          if [ -f "${{ env.INITIAL_BUILD_MARKER }}" ]; then
+            echo "initial_build_done=true" >> $GITHUB_OUTPUT
+          else
+            echo "initial_build_done=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Prepare kerneldriver directory
+        run: |
+          mkdir -p kerneldriver
+          if [ -z "$(ls -A ./code/ 2>/dev/null)" ]; then
+            echo "Error: No driver source files found in code directory"
+            exit 1
+          fi
+          mv ./code/*.h ./code/*.c ./code/Makefile kerneldriver/
+
+      - name: Install repo tool
+        if: steps.cache_check.outputs.kernel_cached == 'false'
+        run: |
+          sudo curl -L https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
+          sudo chmod a+x /usr/local/bin/repo
+
+      - name: Fetch kernel source
+        if: steps.cache_check.outputs.kernel_cached == 'false'
+        run: |
+          mkdir -p ${{ env.KERNEL_DIR }} && cd ${{ env.KERNEL_DIR }}
+          repo init -u https://android.googlesource.com/kernel/manifest -b common-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}
+          repo sync -j$(nproc) -c --no-tags --optimized-fetch --force-sync
+
+      - name: Update cache with kernel source
+        if: steps.cache_check.outputs.kernel_cached == 'false'
+        run: |
+          git checkout ${{ env.CACHE_BRANCH }}
+          # Keep only necessary files to reduce cache size
+          rm -rf ${{ env.KERNEL_DIR }}/.repo/projects/*/.git
+          git add ${{ env.KERNEL_DIR }}
+          git commit -m "Cache kernel source for Android ${{ github.event.inputs.android_version }} kernel ${{ github.event.inputs.kernel_version }}"
+          git push -u origin ${{ env.CACHE_BRANCH }}
+
+      - name: Copy kerneldriver to source
+        run: |
+          cd ${{ env.KERNEL_DIR }}
+          cp -r ../kerneldriver common/drivers/
+
+      - name: Modify drivers Makefile
+        run: |
+          cd ${{ env.KERNEL_DIR }}
+          if ! grep -q "obj-y += kerneldriver/" common/drivers/Makefile; then
+            echo "obj-y += kerneldriver/" >> common/drivers/Makefile
+          fi
+
+      - name: Add module to GKI modules list (Android >13)
+        if: ${{ github.event.inputs.android_version > 13 }}
+        run: |
+          cd ${{ env.KERNEL_DIR }}
+          MODULE_NAME="drivers/kerneldriver/${{ github.event.inputs.driver_name }}"
+          
+          awk -i inplace -v module="$MODULE_NAME" '
+            BEGIN { added=0 }
+            /_COMMON_GKI_MODULES_LIST = \[/ { in_list=1 }
+            in_list && /\]/ {
+              if (!added) {
+                print "    \"" module "\","
+                added=1
+              }
+              in_list=0
+            }
+            in_list && !added {
+              if (module < $0) {
+                print "    \"" module "\","
+                added=1
+              }
+            }
+            { print }
+          ' common/modules.bzl
+          
+      - name: Add module to GKI modules list (Android <=13)
+        if: ${{ github.event.inputs.android_version <= 13 }}
+        run: |
+          cd ${{ env.KERNEL_DIR }}
+          MODULE_ENTRY="drivers/kerneldriver/${{ github.event.inputs.driver_name }}"
+          if ! grep -q "$MODULE_ENTRY" common/android/gki_${{ github.event.inputs.target_arch }}_modules; then
+            echo "$MODULE_ENTRY" >> common/android/gki_${{ github.event.inputs.target_arch }}_modules
+          fi
+
+      - name: Increase stack frame size limit
+        run: |
+          cd ${{ env.KERNEL_DIR }}
+          find . -type f -name "Makefile*" -exec sed -i 's/-Wframe-larger-than=[0-9]*/-Wframe-larger-than=4096/g' {} +
+          grep -q "FRAME_WARN" common/Makefile || echo 'KBUILD_CFLAGS += -Wframe-larger-than=4096' >> common/Makefile
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc python-is-python3
+
+      - name: Build kernel (first run) or module (subsequent runs)
+        run: |
+          cd ${{ env.KERNEL_DIR }}
+          export ARCH=${{ github.event.inputs.target_arch }}
+          
+          if [ ${{ steps.cache_check.outputs.initial_build_done }} = "false" ]; then
+            echo "Performing initial full kernel build"
+            if [ ${{ github.event.inputs.android_version }} -le 12 ]; then
+              BUILD_CONFIG=common/build.config.gki.${{ github.event.inputs.target_arch }} LTO=thin build/build.sh -j$(nproc)
+              OUTPUT_PATH="out/android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}/dist"
+            else
+              tools/bazel run --local_cpu_resources=50 --local_ram_resources=6144 //common:kernel_${{ github.event.inputs.target_arch }}_dist
+              OUTPUT_PATH="out/kernel_${{ github.event.inputs.target_arch }}"
+            fi
+            # Mark initial build completion
+            touch ../../${{ env.INITIAL_BUILD_MARKER }}
+          else
+            echo "Performing incremental module build"
+            if [ ${{ github.event.inputs.android_version }} -le 12 ]; then
+              BUILD_CONFIG=common/build.config.gki.${{ github.event.inputs.target_arch }} LTO=thin build/build.sh -j$(nproc) modules
+              OUTPUT_PATH="out/android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}/dist"
+            else
+              tools/bazel run --local_cpu_resources=50 --local_ram_resources=6144 //common:kernel_${{ github.event.inputs.target_arch }}_modules
+              OUTPUT_PATH="out/kernel_${{ github.event.inputs.target_arch }}"
+            fi
+          fi
+          echo "OUTPUT_PATH=$OUTPUT_PATH" >> $GITHUB_ENV
+
+      - name: Update cache with build artifacts
+        run: |
+          git checkout ${{ env.CACHE_BRANCH }}
+          git add ${{ env.INITIAL_BUILD_MARKER }}
+          git add ${{ env.KERNEL_DIR }}/out
+          git commit -m "Update build artifacts for ${{ github.event.inputs.driver_name }}"
+          git push -u origin ${{ env.CACHE_BRANCH }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: kernel-driver-${{ github.event.inputs.target_arch }}
+          path: |
+            ${{ env.KERNEL_DIR }}/${{ env.OUTPUT_PATH }}/*.ko
+            ${{ env.KERNEL_DIR }}/${{ env.OUTPUT_PATH }}/Image
