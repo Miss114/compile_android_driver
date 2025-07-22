@@ -21,31 +21,42 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      CACHE_BRANCH: kernel-cache-${{ github.event.input.inputs.android_version }}-${{ github.event.inputs.kernel_version }}
+      # 修复缓存分支变量引用错误（原input.inputs多余）
+      CACHE_BRANCH: kernel-cache-${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}
       KERNEL_DIR: android-kernel
       INITIAL_BUILD_MARKER: .initial_build_complete
+      # 增加Git LFS支持大型文件
+      LARGE_FILE_PATTERNS: '*.ko *.img Image vmlinux'
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4.2.2
+        with:
+          # 确保拉取所有分支信息
+          fetch-depth: 0
 
       - name: Configure Git
         run: |
           git config --global user.email "1917767839@qq.com"
           git config --global user.name "Miss"
+          # 配置Git LFS处理大型文件
+          git lfs install
 
       - name: Prepare cache branch
         run: |
-          # Create cache branch if not exists
+          # 确保工作区干净
+          git reset --hard
+          # 创建或切换缓存分支
           if ! git rev-parse --verify origin/${{ env.CACHE_BRANCH }}; then
             git checkout -b ${{ env.CACHE_BRANCH }}
             git commit --allow-empty -m "Initialize kernel cache branch"
-            git push -u origin ${{ env.CACHE_BRANCH }}
+            git push -u origin ${{ env.CACHE_BRANCH }} --timeout=99999
           else
             git checkout ${{ env.CACHE_BRANCH }}
-            git pull origin ${{ env.CACHE_BRANCH }}
+            # 拉取远程更新并处理冲突
+            git pull origin ${{ env.CACHE_BRANCH }} --rebase --autostash
           fi
-          # Restore main branch code while keeping cache
+          # 恢复main分支代码
           git checkout main -- .
 
       - name: Check cache status
@@ -82,17 +93,25 @@ jobs:
         run: |
           mkdir -p ${{ env.KERNEL_DIR }} && cd ${{ env.KERNEL_DIR }}
           repo init -u https://android.googlesource.com/kernel/manifest -b common-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}
-          repo sync -j$(nproc) -c --no-tags --optimized-fetch --force-sync
+          # 降低并行数避免网络拥塞
+          repo sync -j4 -c --no-tags --optimized-fetch --force-sync
 
       - name: Update cache with kernel source
         if: steps.cache_check.outputs.kernel_cached == 'false'
         run: |
           git checkout ${{ env.CACHE_BRANCH }}
-          # Keep only necessary files to reduce cache size
+          # 清理冗余文件减少推送体积
           rm -rf ${{ env.KERNEL_DIR }}/.repo/projects/*/.git
+          rm -rf ${{ env.KERNEL_DIR }}/.repo/project-objects/*/.git
+          # 用LFS跟踪大型文件
+          for pattern in ${{ env.LARGE_FILE_PATTERNS }}; do
+            git lfs track "$pattern"
+          done
+          git add .gitattributes
           git add ${{ env.KERNEL_DIR }}
           git commit -m "Cache kernel source for Android ${{ github.event.inputs.android_version }} kernel ${{ github.event.inputs.kernel_version }}"
-          git push -u origin ${{ env.CACHE_BRANCH }}
+          # 最大化超时时间并启用压缩
+          git push -u origin ${{ env.CACHE_BRANCH }} --timeout=99999 --compress=9
 
       - name: Copy kerneldriver to source
         run: |
@@ -182,10 +201,14 @@ jobs:
       - name: Update cache with build artifacts
         run: |
           git checkout ${{ env.CACHE_BRANCH }}
+          # 用LFS跟踪编译产物
+          for pattern in ${{ env.LARGE_FILE_PATTERNS }}; do
+            git lfs track "$pattern"
+          done
           git add ${{ env.INITIAL_BUILD_MARKER }}
           git add ${{ env.KERNEL_DIR }}/out
           git commit -m "Update build artifacts for ${{ github.event.inputs.driver_name }}"
-          git push -u origin ${{ env.CACHE_BRANCH }}
+          git push -u origin ${{ env.CACHE_BRANCH }} --timeout=99999 --compress=9
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4.6.2
