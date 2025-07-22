@@ -1,0 +1,45 @@
+name: 初始化 Android 12 5.10 内核缓存
+
+on:
+  workflow_dispatch:  # 手动触发一次即可
+
+jobs:
+  init-cache:
+    runs-on: ubuntu-20.04
+    env:
+      CACHE_BRANCH: android12-5.10-cache
+      KERNEL_DIR: android-kernel
+      KERNEL_MANIFEST_BRANCH: common-android12-5.10
+
+    steps:
+      - name: 拉取仓库代码
+        uses: actions/checkout@v4.2.2
+
+      - name: 创建缓存分支
+        run: |
+          if ! git rev-parse --verify ${{ env.CACHE_BRANCH }}; then
+            git checkout -b ${{ env.CACHE_BRANCH }}
+            git commit --allow-empty -m "初始化缓存分支"
+            git push -u origin ${{ env.CACHE_BRANCH }}
+          else
+            git checkout ${{ env.CACHE_BRANCH }}
+          fi
+
+      - name: 安装 repo 工具
+        run: |
+          sudo curl -L https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
+          sudo chmod a+x /usr/local/bin/repo
+
+      - name: 拉取内核源码（清华镜像）
+        run: |
+          mkdir -p ${{ env.KERNEL_DIR }} && cd ${{ env.KERNEL_DIR }}
+          repo init -u https://android.googlesource.com/kernel/manifest -b ${{ env.KERNEL_MANIFEST_BRANCH }}
+          repo sync -j4 -c --no-tags --optimized-fetch  # 降低并行数，避免资源超限
+
+      - name: 保存缓存
+        run: |
+          # 仅保留源码和工具链，排除临时文件
+          rm -rf ${{ env.KERNEL_DIR }}/.repo/projects/*/.git
+          git add .
+          git commit -m "完成内核源码缓存: $(date)"
+          git push -u origin ${{ env.CACHE_BRANCH }}
