@@ -107,6 +107,8 @@ jobs:
           if [ ${{ github.event.inputs.android_version }} -le 13 ]; then
             BUILD_CONFIG=common/build.config.gki.${{ github.event.inputs.target_arch }} LTO=thin build/build.sh modules -j32
             OUTPUT_PATH="out/android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}/dist"
+            tar -cJ --xz-options=-9 -f ../source.tar.xz ..
+            cp ../source.tar.xz "$OUTPUT_PATH"
             cd "$OUTPUT_PATH"
             rm -f Image \
               abi_symbollist \
